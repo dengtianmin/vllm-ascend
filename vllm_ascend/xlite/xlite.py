@@ -31,10 +31,26 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import (
+    AttnDSA,
+    AttnHybrid,
+    AttnMeta,
+    AttnMetaV2,
+    AttnMHA,
+    AttnMLA,
+    Runtime,
+    ScoringFuncSigmoid,
+    ScoringFuncSoftmax,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
+from vllm_ascend.xlite.gdn_cache import (
+    cache_support_reason,
+    decode_metadata,
+    decode_positions,
+    physical_slot_mapping,
+)
 from vllm_ascend.xlite.utils import (
     AttnMetadataRouter,
     WeightGetterConfig,
@@ -499,6 +515,259 @@ class QwenMoeXliteModel(StandardXliteModel):
         xlite_config.norm_topk_prob = hf_config.norm_topk_prob
 
 
+class Qwen35XliteModel(StandardXliteModel):
+    """XLite adapter for dense Qwen3.5's hybrid GDN/MHA architecture."""
+
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _attn_metadata_type = (StandardXliteModel._attn_metadata_type, GDNAttentionMetadata)
+    _supported_architectures = ["Qwen3_5ForConditionalGeneration"]
+
+    @staticmethod
+    def _is_full_attention(layer: nn.Module) -> bool:
+        return getattr(layer, "layer_type", None) == "full_attention"
+
+    def _get_rope(self, layer_idx: int = 0) -> AscendRotaryEmbedding | None:
+        # Qwen3.5 commonly starts with GDN layers, which have no rotary embedding.
+        layers, _ = self._get_layers_and_model_prefix()
+        for layer in layers:
+            if self._is_full_attention(layer):
+                rope = get_dotted_attr(layer, "self_attn.rotary_emb")
+                if rope is not None:
+                    return rope
+        logger.warning_once("xlite adapter: Rotary embedding not found in Qwen3.5 full-attention layers.")
+        return None
+
+    def _build_model_config(self) -> None:
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+        if self.quantization or self.vllm_config.lora_config is not None:
+            raise NotImplementedError("Qwen3.5 XLite requires unquantized weights without LoRA.")
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError("Qwen3.5 XLite full attention requires FP16 or BF16 activations.")
+        mode = self.vllm_config.cache_config.mamba_cache_mode
+        if mode not in ("none", "align"):
+            raise NotImplementedError("Qwen3.5 XLite supports Mamba cache modes none and align.")
+        if not getattr(hf_config, "attn_output_gate", True):
+            raise NotImplementedError("Qwen3.5 XLite requires the full-attention output gate.")
+        if not hasattr(xlite_config, "linear_block_table_indices"):
+            raise RuntimeError("Qwen3.5 AttnMetaV2 requires the matching GVirt XLite extension.")
+        # GDN projections consume ND weights directly.
+        xlite_config.weight_nz = False
+        # V2 carries 1D positions. Equal text axes use ordinary RoPE; retaining
+        # MRoPE masks would make the kernel read past this 1D position tensor.
+        xlite_config.mrope_section = []
+        xlite_config.mrope_interleaved = False
+        xlite_config.deepstack_num_level = 0
+        tp_size = xlite_config.def_tp_size
+        max_decode = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens, self.vllm_config.scheduler_config.max_num_seqs
+        )
+        xlite_config.max_m = (max_decode + tp_size - 1) // tp_size * tp_size
+
+        layer_types = list(getattr(hf_config, "layer_types", []))
+        if not layer_types:
+            layers, _ = self._get_layers_and_model_prefix()
+            layer_types = [getattr(layer, "layer_type", "") for layer in layers]
+        full_attention_indices = [i for i, layer_type in enumerate(layer_types) if layer_type == "full_attention"]
+        if not full_attention_indices:
+            raise ValueError("Qwen3.5 XLite adapter requires at least one full-attention layer.")
+
+        full_attention_interval = full_attention_indices[0] + 1
+        expected_full_attention_indices = list(
+            range(full_attention_interval - 1, len(layer_types), full_attention_interval)
+        )
+        if full_attention_indices != expected_full_attention_indices:
+            raise ValueError(
+                "XLite Qwen3.5 expects full-attention layers at a fixed interval; "
+                f"got indices {full_attention_indices}."
+            )
+
+        xlite_config.attn_type = AttnHybrid
+        xlite_config.full_attention_interval = full_attention_interval
+        xlite_config.linear_num_k_heads = hf_config.linear_num_key_heads
+        xlite_config.linear_num_v_heads = hf_config.linear_num_value_heads
+        xlite_config.linear_key_head_dim = hf_config.linear_key_head_dim
+        xlite_config.linear_value_head_dim = hf_config.linear_value_head_dim
+        xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+        xlite_config.qkv_bias = bool(getattr(hf_config, "qkv_bias", False))
+        xlite_config.qk_norm = True
+        xlite_config.attn_output_gate = bool(getattr(hf_config, "attn_output_gate", True))
+        if len(layer_types) != xlite_config.n_layers or any(
+            value not in ("full_attention", "linear_attention") for value in layer_types
+        ):
+            raise ValueError("Qwen3.5 layer types must describe every decoder layer.")
+        if (
+            xlite_config.linear_num_k_heads <= 0
+            or xlite_config.linear_num_v_heads <= 0
+            or xlite_config.linear_num_k_heads % tp_size
+            or xlite_config.linear_num_v_heads % tp_size
+            or xlite_config.linear_num_v_heads % xlite_config.linear_num_k_heads
+        ):
+            raise ValueError("Qwen3.5 GDN requires positive TP-divisible heads and integral V/K grouping.")
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        xlite_config.block_size = AscendAttentionBackend.get_supported_kernel_block_sizes()[0]
+        state_block_size = self.vllm_config.cache_config.mamba_block_size
+        if state_block_size is None or state_block_size <= 0:
+            raise ValueError("Qwen3.5 requires the resolved Mamba block size.")
+        # Stable V2 entries before native Model.init: MHA zero, then one per GDN
+        # layer. Registration resolves these entries to actual vLLM cache groups.
+        block_sizes = [xlite_config.block_size]
+        table_indices = []
+        for layer_type in layer_types:
+            if layer_type == "full_attention":
+                table_indices.append(0)
+            else:
+                table_indices.append(len(block_sizes))
+                block_sizes.append(state_block_size)
+        xlite_config.block_sizes = block_sizes
+        xlite_config.linear_block_table_indices = table_indices
+        xlite_config.linear_cache_aligned = mode == "align"
+
+    def _build_model(self) -> None:
+        if self.quantization:
+            raise NotImplementedError("Qwen3.5 XLite adapter currently supports unquantized weights only.")
+
+        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        hf_config = self.hf_text_config
+        layers, model_prefix = self._get_layers_and_model_prefix()
+
+        def gemma_norm(weight: torch.Tensor) -> torch.Tensor:
+            # Qwen3.5 uses Gemma-style RMSNorm, while XLite expects the effective scale.
+            return (weight.float() + 1.0).to(weight.dtype).contiguous()
+
+        xlite_model.embed = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.embed_tokens.weight", raises=True)
+        xlite_model.norm = gemma_norm(
+            get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True)
+        )
+        if hf_config.tie_word_embeddings:
+            xlite_model.head = xlite_model.embed
+        else:
+            xlite_model.head = get_dotted_attr(self.npu_runnable, f"{model_prefix}lm_head.weight", raises=True)
+
+        xlite_model.attn_norm = [gemma_norm(w) for w in get_layer_weights(layers, "input_layernorm.weight")]
+        xlite_model.mlp_norm = [gemma_norm(w) for w in get_layer_weights(layers, "post_attention_layernorm.weight")]
+        xlite_model.mlp_up_gate = get_layer_weights(layers, "mlp.gate_up_proj.weight")
+        xlite_model.mlp_down = get_layer_weights(layers, "mlp.down_proj.weight")
+
+        def nd(weight: torch.Tensor) -> torch.Tensor:
+            return torch_npu.npu_format_cast(weight, torch_npu.Format.ND).contiguous()
+
+        xlite_model.embed = nd(xlite_model.embed)
+        xlite_model.head = xlite_model.embed if hf_config.tie_word_embeddings else nd(xlite_model.head)
+        xlite_model.mlp_up_gate = [nd(weight) for weight in xlite_model.mlp_up_gate]
+        xlite_model.mlp_down = [nd(weight) for weight in xlite_model.mlp_down]
+        empty = torch.empty(0, dtype=self.dtype, device=self.device)
+        mha_qkv, attn_out, mha_q_norm, mha_k_norm = [], [], [], []
+        mha_qkv_bias = []
+        linear_qkv, linear_z, linear_b, linear_a = [], [], [], []
+        linear_conv, linear_a_log, linear_dt_bias, linear_norm, linear_out = [], [], [], [], []
+
+        tp_size = get_tensor_model_parallel_world_size()
+        for layer in layers:
+            if self._is_full_attention(layer):
+                attn = layer.self_attn
+                proj = attn.qkv_proj
+                q_width = attn.num_heads * attn.head_dim
+                kv_width = attn.num_kv_heads * attn.head_dim
+
+                # vLLM stores each query head as [Q | output-gate], followed by K and V.
+                # XLite's hybrid kernel expects [Q | K | V | output-gate].
+                qkv_weight = nd(proj.weight)
+                q_gate = qkv_weight[: 2 * q_width].view(attn.num_heads, 2, attn.head_dim, -1)
+                q_weight = q_gate[:, 0].reshape(q_width, -1).contiguous()
+                gate_weight = q_gate[:, 1].reshape(q_width, -1).contiguous()
+                k_start = 2 * q_width
+                k_weight = qkv_weight[k_start : k_start + kv_width]
+                v_weight = qkv_weight[k_start + kv_width : k_start + 2 * kv_width]
+                mha_qkv.append(torch.cat((q_weight, k_weight, v_weight, gate_weight), dim=0).contiguous())
+                attn_out.append(nd(attn.o_proj.weight))
+                mha_q_norm.append(gemma_norm(attn.q_norm.weight))
+                mha_k_norm.append(gemma_norm(attn.k_norm.weight))
+
+                if xlite_config.qkv_bias:
+                    qkv_bias = proj.bias
+                    if qkv_bias is None:
+                        raise ValueError("Qwen3.5 config enables qkv_bias, but a full-attention layer has no bias.")
+                    q_gate_bias = qkv_bias[: 2 * q_width].view(attn.num_heads, 2, attn.head_dim)
+                    q_bias = q_gate_bias[:, 0].reshape(-1).contiguous()
+                    gate_bias = q_gate_bias[:, 1].reshape(-1).contiguous()
+                    k_bias = qkv_bias[k_start : k_start + kv_width]
+                    v_bias = qkv_bias[k_start + kv_width : k_start + 2 * kv_width]
+                    mha_qkv_bias.append(torch.cat((q_bias, k_bias, v_bias, gate_bias), dim=0).contiguous())
+
+                linear_qkv.append(empty)
+                linear_z.append(empty)
+                linear_b.append(empty)
+                linear_a.append(empty)
+                linear_conv.append(empty)
+                linear_a_log.append(empty)
+                linear_dt_bias.append(empty)
+                linear_norm.append(empty)
+                linear_out.append(empty)
+            else:
+                linear = layer.linear_attn
+                qkvz_weight = nd(linear.in_proj_qkvz.weight)
+                local_key_dim = linear.key_dim // tp_size
+                local_value_dim = linear.value_dim // tp_size
+                qkv_end = 2 * local_key_dim + local_value_dim
+                linear_qkv.append(qkvz_weight[:qkv_end].contiguous())
+                linear_z.append(qkvz_weight[qkv_end : qkv_end + local_value_dim].contiguous())
+
+                ba_weight = nd(linear.in_proj_ba.weight)
+                local_value_heads = hf_config.linear_num_value_heads // tp_size
+                linear_b.append(ba_weight[:local_value_heads].contiguous())
+                linear_a.append(ba_weight[local_value_heads : 2 * local_value_heads].contiguous())
+                linear_conv.append(linear.conv1d.weight)
+                linear_a_log.append(linear.A_log)
+                linear_dt_bias.append(linear.dt_bias)
+                # GDN's gated RMSNorm uses the stored scale directly (unlike Gemma RMSNorm).
+                linear_norm.append(linear.norm.weight)
+                linear_out.append(nd(linear.out_proj.weight))
+
+                mha_qkv.append(empty)
+                attn_out.append(empty)
+                mha_q_norm.append(empty)
+                mha_k_norm.append(empty)
+                if xlite_config.qkv_bias:
+                    mha_qkv_bias.append(empty)
+
+        xlite_model.mha_qkv = mha_qkv
+        xlite_model.attn_out = attn_out
+        xlite_model.mha_q_norm = mha_q_norm
+        xlite_model.mha_k_norm = mha_k_norm
+        if xlite_config.qkv_bias:
+            xlite_model.mha_qkv_bias = mha_qkv_bias
+        xlite_model.linear_in_proj_qkv = linear_qkv
+        xlite_model.linear_in_proj_z = linear_z
+        xlite_model.linear_in_proj_b = linear_b
+        xlite_model.linear_in_proj_a = linear_a
+        xlite_model.linear_conv1d = linear_conv
+        xlite_model.linear_a_log = linear_a_log
+        xlite_model.linear_dt_bias = linear_dt_bias
+        xlite_model.linear_norm = linear_norm
+        xlite_model.linear_out_proj = linear_out
+
+    def extract_kv_cache(self, kv_caches: list[tuple[torch.Tensor, ...]], /) -> list[tuple[torch.Tensor, ...]]:
+        """Reference caches bound to attention modules without changing storage."""
+        from vllm_ascend.xlite.utils import _DUMMY_TENSOR
+
+        layers, _ = self._get_layers_and_model_prefix()
+        if len(layers) != self.xlite_config.n_layers:
+            raise ValueError("Qwen3.5 model/cache layer count mismatch.")
+        full_caches: list[tuple[torch.Tensor, ...]] = []
+        for layer_idx, layer in enumerate(layers):
+            if not self._is_full_attention(layer):
+                full_caches.append((_DUMMY_TENSOR, _DUMMY_TENSOR))
+                continue
+            cache = layer.self_attn.attn.kv_cache
+            if len(cache) < 2:
+                raise ValueError(f"Qwen3.5 full-attention layer {layer_idx} requires K and V cache tensors.")
+            full_caches.append((cache[0], cache[1]))
+        return full_caches
+
+
 class Glm4MoeXliteModel(StandardXliteModel):
     """xlite adapter for GLM4 MoE architectures."""
 
@@ -701,6 +970,7 @@ class XliteWrapper:
         """
         self.npu_runner = npu_runner
         self.npu_runnable = npu_runner.fallback_model
+        self.vllm_config = vllm_config
         self.device = device
         # `full_mode` only sizes the token budget (see the comment in `StandardXliteModel._build_config`).
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
@@ -708,6 +978,8 @@ class XliteWrapper:
 
         set_dummy_tensor(torch.empty(1, device=device, dtype=vllm_config.model_config.dtype))
         self.adapter_xlite_model = get_adapter_xlite_model(npu_runner, vllm_config)  # python adapter instance
+        self._qwen35_hybrid = isinstance(self.adapter_xlite_model, Qwen35XliteModel)
+        self.gdn_cache_reason: str | None = "cache not registered"
         self.xlite_model = self.adapter_xlite_model.xlite_model  # xlite C++ model instance
         self.freq_cis = self.adapter_xlite_model.rope_cossin_cache
         xlite_config = self.adapter_xlite_model.xlite_config
@@ -756,6 +1028,229 @@ class XliteWrapper:
             kv_caches (list[tuple[torch.Tensor, ...]]): Runtime KV cache handles or tensors.
         """
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
+        if self._qwen35_hybrid:
+            self._register_qwen35_caches()
+
+    def _register_qwen35_caches(self) -> None:
+        """Bind native views and resolve static V2 entries to framework groups."""
+        adapter = cast(Qwen35XliteModel, self.adapter_xlite_model)
+        layers, _ = adapter._get_layers_and_model_prefix()
+        cfg = adapter.xlite_config
+        groups = self.npu_runner.kv_cache_config.kv_cache_groups
+        group_by_layer = {name: gid for gid, group in enumerate(groups) for name in group.layer_names}
+        self.cache_table_groups = [-1] * len(cfg.block_sizes)
+        self.full_attention_prefixes = []
+        self.full_attention_page_factor = None
+        self.gdn_cache_reason = None
+        local_k = cfg.linear_num_k_heads // cfg.def_tp_size
+        local_v = cfg.linear_num_v_heads // cfg.def_tp_size
+        channels = 2 * local_k * cfg.linear_key_head_dim + local_v * cfg.linear_value_head_dim
+        for index, layer in enumerate(layers):
+            full = adapter._is_full_attention(layer)
+            prefix = layer.self_attn.attn.layer_name if full else layer.linear_attn.prefix
+            gid = group_by_layer.get(prefix)
+            if gid is None:
+                self.gdn_cache_reason = f"missing framework cache group for {prefix}"
+                break
+            entry = cfg.linear_block_table_indices[index]
+            previous = self.cache_table_groups[entry]
+            if previous != -1 and previous != gid:
+                self.gdn_cache_reason = "full-attention layers require a shared block table"
+                break
+            self.cache_table_groups[entry] = gid
+            table = self.npu_runner.input_batch.block_table[gid]
+            if table.block_size != cfg.block_sizes[entry]:
+                self.gdn_cache_reason = "framework and XLite cache block sizes differ"
+                break
+            if full:
+                self.full_attention_prefixes.append(prefix)
+                k, v = self.kv_caches[index]
+                heads = max(cfg.n_kv_heads // cfg.def_tp_size, 1)
+                logical_stride = cfg.block_sizes[0] * heads * cfg.head_dim
+                inner = (heads * cfg.head_dim, cfg.head_dim, 1)
+                expected = (cfg.block_sizes[0], heads, cfg.head_dim)
+                if (
+                    k.ndim != 4
+                    or tuple(k.shape[1:]) != expected
+                    or k.shape != v.shape
+                    or k.stride()[1:] != inner
+                    or v.stride() != k.stride()
+                    or k.stride(0) % logical_stride
+                    or k.stride(0) < logical_stride
+                    or k.dtype != adapter.dtype
+                    or v.dtype != k.dtype
+                    or k.device != self.device
+                    or v.device != self.device
+                ):
+                    self.gdn_cache_reason = "unsupported full-attention cache descriptor"
+                    break
+                factor = k.stride(0) // logical_stride
+                if self.full_attention_page_factor not in (None, factor):
+                    self.gdn_cache_reason = "full-attention page strides differ across layers"
+                    break
+                self.full_attention_page_factor = factor
+            else:
+                state = getattr(layer.linear_attn, "kv_cache", None)
+                if not isinstance(state, (tuple, list)) or len(state) != 2:
+                    self.gdn_cache_reason = "missing initialized native GDN cache"
+                    break
+                conv, ssm = state
+                reason = cache_support_reason(
+                    conv,
+                    ssm,
+                    channels=channels,
+                    heads=local_v,
+                    key_dim=cfg.linear_key_head_dim,
+                    value_dim=cfg.linear_value_head_dim,
+                    width=cfg.linear_conv_kernel_dim,
+                    dtype=adapter.dtype,
+                    device=self.device,
+                )
+                if reason is not None:
+                    self.gdn_cache_reason = reason
+                    break
+                self.kv_caches[index] = (conv, ssm)
+        if self.gdn_cache_reason is None and any(gid < 0 for gid in self.cache_table_groups):
+            self.gdn_cache_reason = "incomplete V2 cache table mapping"
+        if self.gdn_cache_reason:
+            logger.warning("xlite Qwen3.5 native fallback: %s", self.gdn_cache_reason)
+        else:
+            logger.info("xlite Qwen3.5 registered native caches with raw V2 state tables")
+
+    def _qwen35_forward(
+        self,
+        context: Any,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> torch.Tensor | None:
+        config = self.vllm_config
+        parallel = config.parallel_config
+        metadata = context.attn_metadata
+        if (
+            self.gdn_cache_reason is not None
+            or (input_ids is None and inputs_embeds is None)
+            or intermediate_tensors is not None
+            or self.data_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or config.speculative_config is not None
+            or config.kv_transfer_config is not None
+            or config.lora_config is not None
+            or config.cache_config.mamba_cache_mode not in ("none", "align")
+            or not isinstance(metadata, dict)
+            or not self.full_attention_prefixes
+            or getattr(self.npu_runnable, "deepstack_input_embeds", [])
+        ):
+            return None
+        mha = metadata.get(self.full_attention_prefixes[0])
+        decoded = decode_metadata(mha, self.device)
+        if decoded is None:
+            return None
+        count = len(decoded["lens_cpu"])
+        if count > self.max_tokens or count > config.scheduler_config.max_num_seqs:
+            return None
+        for prefix in self.full_attention_prefixes[1:]:
+            current = decode_metadata(metadata.get(prefix), self.device)
+            if current is None or current["cached_lens_cpu"] != decoded["cached_lens_cpu"]:
+                return None
+        source = inputs_embeds if inputs_embeds is not None else input_ids
+        if (
+            source is None
+            or source.ndim == 0
+            or source.shape[0] < count
+            or source.device != self.device
+            or not source.is_contiguous()
+        ):
+            return None
+        if inputs_embeds is not None and (
+            inputs_embeds.ndim != 2
+            or inputs_embeds.shape[1] != self.adapter_xlite_model.xlite_config.hidden_size
+            or inputs_embeds.dtype != self.adapter_xlite_model.dtype
+        ):
+            return None
+        if input_ids is not None and (
+            input_ids.ndim != 1
+            or input_ids.dtype != torch.int64
+            or input_ids.device != self.device
+            or input_ids.numel() < count
+            or not input_ids.is_contiguous()
+        ):
+            return None
+        host_positions = getattr(getattr(self.npu_runner, "mrope_positions", None), "cpu", None)
+        position = decode_positions(positions, count, host_positions)
+        if position is None or position.device != self.device:
+            return None
+        # Read device sources directly. The router must not move block tables to CPU.
+        router = AttnMetadataRouter(attn_metadata=mha, device=self.device)
+        full_table = router.block_tables
+        slots = getattr(mha, "slot_mapping", None)
+        if (
+            not isinstance(slots, torch.Tensor)
+            or slots.device != self.device
+            or slots.ndim != 1
+            or slots.numel() < count
+            or slots.dtype not in (torch.int32, torch.int64)
+            or full_table.ndim != 2
+            or full_table.shape[0] < count
+            or full_table.dtype != torch.int32
+            or full_table.device != self.device
+        ):
+            return None
+        cfg = self.adapter_xlite_model.xlite_config
+        factor = self.full_attention_page_factor
+        if full_table.shape[1] < (max(decoded["cached_lens_cpu"]) + cfg.block_sizes[0]) // cfg.block_sizes[0]:
+            return None
+        tables = [(full_table[:count] * factor).contiguous() if factor != 1 else full_table[:count].contiguous()]
+        mappings = [physical_slot_mapping(slots[:count], block_size=cfg.block_sizes[0], page_factor=factor)]
+        empty = slots.new_empty(0, dtype=torch.int32)
+        for entry, gid in enumerate(self.cache_table_groups[1:], 1):
+            # This is the raw framework table, never the builder's gathered state indices.
+            table = self.npu_runner.input_batch.block_table[gid].get_device_tensor()
+            minimum = (
+                1
+                if config.cache_config.mamba_cache_mode == "none"
+                else (max(decoded["cached_lens_cpu"]) + cfg.block_sizes[entry]) // cfg.block_sizes[entry]
+            )
+            if (
+                table.ndim != 2
+                or table.shape[0] < count
+                or table.shape[1] < minimum
+                or table.dtype != torch.int32
+                or table.device != self.device
+                or table.stride(1) != 1
+                or table.stride(0) < table.shape[1]
+            ):
+                return None
+            tables.append(table[:count])
+            mappings.append(empty)
+        meta = AttnMetaV2()
+        for key, value in decoded.items():
+            setattr(meta, key, value)
+        meta.positions = position
+        meta.block_tables = tables
+        meta.slot_mapping = mappings
+        output = self.hidden_states[:count]
+        args = dict(
+            rt=self.xlite_rt,
+            attn_meta=meta,
+            kv_cache=self.kv_caches,
+            output=output,
+            curr_stream=torch.npu.current_stream().npu_stream,
+        )
+        if inputs_embeds is None:
+            self.xlite_model.forward_v2(input=input_ids[:count], freqs_cis=[self.freq_cis], **args)
+        else:
+            self.xlite_model.forward_with_inputs_embeds_v2(
+                input=inputs_embeds[:count],
+                freqs_cis=self.freq_cis,
+                input_ids=input_ids[:count] if input_ids is not None else None,
+                **args,
+            )
+        logger.info_once("xlite Qwen3.5 route: initialized decode with native caches and AttnMetaV2")
+        return output
 
     def __call__(
         self,
@@ -780,6 +1275,15 @@ class XliteWrapper:
             XliteForwardResult: Forward outputs from xlite graph or the original runnable implementation.
         """
         forward_context = get_forward_context()
+        if self._qwen35_hybrid:
+            result = (
+                None
+                if model_kwargs
+                else self._qwen35_forward(forward_context, input_ids, positions, inputs_embeds, intermediate_tensors)
+            )
+            if result is not None:
+                return result
+            return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
         attn_metadata: Any = forward_context.attn_metadata
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
         attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
