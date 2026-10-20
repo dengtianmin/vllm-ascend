@@ -33,7 +33,12 @@ import vllm_ascend.patch.worker.patch_distributed  # noqa
 import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
 import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
 import vllm_ascend.patch.worker.patch_bind_kv_cache  # noqa
-import vllm_ascend.patch.worker.patch_step3p5  # noqa
+# Step-specific patches depend on optional symbols from the selected model.
+# Importing them for Qwen also blocks startup when upstream Step APIs change.
+from vllm.config import get_current_vllm_config
+
+if "Step3p5ForCausalLM" in get_current_vllm_config().model_config.architectures:
+    import vllm_ascend.patch.worker.patch_step3p5  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
@@ -57,28 +62,33 @@ import vllm_ascend.patch.worker.patch_v2.patch_use_v2_model_runner  # noqa
 
 import vllm_ascend.patch.worker.patch_fused_moe  # noqa
 
-import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_model_runner  # noqa
+# The XLite backend uses runner V1. V2-only patches must not import renamed
+# speculative modules when runner V2 is disabled.
+from vllm import envs as vllm_envs
 
-import vllm_ascend.patch.worker.patch_v2.patch_eagle_speculator  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_dspark  # noqa
-import vllm_ascend.patch.worker.patch_v2.patch_adaptive_verification  # noqa
+if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+    import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_model_runner  # noqa
 
-# 310P: draft FULL must use AutoRegressiveAclGraphManager310 (no FIA graph_task).
-# patch_eagle_speculator above installs the 910 manager; re-override here.
-if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as _ar_spec
+    import vllm_ascend.patch.worker.patch_v2.patch_eagle_speculator  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_dspark  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_adaptive_verification  # noqa
 
-    from vllm_ascend._310p.worker.v2.spec_decode.aclgraph import (
-        AutoRegressiveAclGraphManager310,
-    )
+    # 310P: draft FULL must use AutoRegressiveAclGraphManager310 (no FIA graph_task).
+    # patch_eagle_speculator above installs the 910 manager; re-override here.
+    if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
+        from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as _ar_spec
 
-    _ar_spec.SpeculatorCudaGraphManager = AutoRegressiveAclGraphManager310
+        from vllm_ascend._310p.worker.v2.spec_decode.aclgraph import (
+            AutoRegressiveAclGraphManager310,
+        )
+
+        _ar_spec.SpeculatorCudaGraphManager = AutoRegressiveAclGraphManager310
 
 # only patch routed experts capture in main2main.
 import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa

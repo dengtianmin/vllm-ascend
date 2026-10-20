@@ -59,6 +59,7 @@ class AscendMambaManager(MambaManager):
         num_local_computed_tokens: int | None = None,
         num_tokens_main_model: int | None = None,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         if num_tokens_main_model is None:
             assert num_local_computed_tokens is not None
@@ -72,7 +73,11 @@ class AscendMambaManager(MambaManager):
             num_local_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
         )
+        # The shared-cache eager path uses upstream accounting unchanged.
+        if self.mamba_cache_mode == "none":
+            return num_new_blocks
         # When external KV cache is loaded synchronously with new
         # tokens, allocate_new_computed_blocks() allocates one
         # extra block to hold the external cache content. Account

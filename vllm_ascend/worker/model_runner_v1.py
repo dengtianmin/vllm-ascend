@@ -3928,6 +3928,7 @@ class NPUModelRunner(GPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -4248,7 +4249,9 @@ class NPUModelRunner(GPUModelRunner):
             active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_runtime_mode)
             self.kvpp.prepare_forward(False)
 
-            with set_ascend_forward_context(
+            with self.maybe_randomize_inputs(
+                input_ids, inputs_embeds, randomize_inputs=randomize_inputs
+            ), set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
