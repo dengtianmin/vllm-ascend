@@ -601,7 +601,7 @@ class Qwen35XliteModel(StandardXliteModel):
         xlite_config.attn_output_gate = True
         # qkv bias follows the actual weights (the vllm Qwen3Next qkv_proj is built with bias=False).
         xlite_config.qkv_bias = False
-        xlite_config.block_sizes = [xlite_config.block_size]
+        self._finalize_cache_geometry()
 
         # MoE (Qwen3_5MoeForCausalLM only; the dense model keeps the Standard all-dense defaults).
         if getattr(hf_config, "num_experts", 0):
@@ -612,6 +612,25 @@ class Qwen35XliteModel(StandardXliteModel):
             xlite_config.norm_topk_prob = hf_config.norm_topk_prob
             xlite_config.scoring_func = ScoringFuncSoftmax
             xlite_config.route_scale = 1.0
+
+    def _finalize_cache_geometry(self) -> None:
+        # Backend selection needs the registered attention layers. Finalize the
+        # manager page before Model.init() copies the XLite capacity limits.
+        from vllm.platforms import current_platform
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.utils import select_common_block_size
+
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        current_platform.update_block_size_for_backend(self.vllm_config)
+        manager_block_size = self.vllm_config.cache_config.block_size
+        kernel_block_size = select_common_block_size(manager_block_size, [AscendAttentionBackend])
+        self.xlite_config.block_size = kernel_block_size
+        self.xlite_config.block_sizes = [kernel_block_size]
+        # Native block-table rows cover complete manager pages. Plan the same
+        # capacity with the existing XLite planner, including the final page's
+        # unused columns; vLLM retains its requested model-length limit.
+        self.xlite_config.max_seq_len = cdiv(self.xlite_config.max_seq_len, manager_block_size) * manager_block_size
 
     @staticmethod
     def _gemma_norm(weight: torch.Tensor) -> torch.Tensor:
